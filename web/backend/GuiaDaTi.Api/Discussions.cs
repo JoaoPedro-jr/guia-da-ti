@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -7,16 +8,18 @@ using Microsoft.Extensions.Caching.Memory;
 public sealed class DiscussionsClient(IHttpClientFactory clients, IConfiguration configuration) : IDisposable
 {
     private readonly MemoryCache cache = new(new MemoryCacheOptions { SizeLimit = 128 });
-    private readonly SemaphoreSlim gate = new(1, 1);
+    private readonly ConcurrentDictionary<string, Task<JsonElement>> pending = new();
+    private readonly SemaphoreSlim gate = new(6);
+    private int generation;
     private readonly string repository = configuration["DISCUSSIONS_REPOSITORY"] ?? "guia-da-ti/guia-da-ti-dados";
     private readonly string? token = configuration["DISCUSSIONS_TOKEN"];
     public bool Configured => !string.IsNullOrWhiteSpace(token)
         && Regex.IsMatch(repository, @"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$");
     public string RepositoryUrl => $"https://github.com/{repository}/discussions";
-    public async Task InvalidateAsync(CancellationToken cancellation) {
-        await gate.WaitAsync(cancellation);
-        try { cache.Clear(); }
-        finally { gate.Release(); }
+    // Queries already in flight still answer their callers, but their results are not cached.
+    public Task InvalidateAsync(CancellationToken cancellation) {
+        lock (cache) { generation++; cache.Clear(); pending.Clear(); }
+        return Task.CompletedTask;
     }
 
     public async Task<DiscussionList> ListAsync(string? category, string? after, CancellationToken cancellation)
@@ -65,10 +68,28 @@ public sealed class DiscussionsClient(IHttpClientFactory clients, IConfiguration
     {
         var key = query + JsonSerializer.Serialize(variables);
         if (cache.TryGetValue(key, out JsonElement cached)) return cached;
+        // Callers of the same key share one GitHub call; different keys only share the concurrency limit.
+        var mine = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var shared = pending.GetOrAdd(key, mine.Task);
+        if (shared == mine.Task) _ = FillAsync(key, query, variables, mine);
+        return await shared.WaitAsync(cancellation);
+    }
+
+    private async Task FillAsync(string key, string query, object variables, TaskCompletionSource<JsonElement> result)
+    {
+        try { result.SetResult(await FetchAsync(key, query, variables)); }
+        catch (Exception error) { result.SetException(error); }
+        finally { pending.TryRemove(KeyValuePair.Create(key, result.Task)); }
+    }
+
+    // Shared by several callers, so one caller giving up does not cancel the others; the client timeout bounds it.
+    private async Task<JsonElement> FetchAsync(string key, string query, object variables)
+    {
+        var cancellation = CancellationToken.None;
+        var version = Volatile.Read(ref generation);
         await gate.WaitAsync(cancellation);
         try
         {
-            if (cache.TryGetValue(key, out cached)) return cached;
             using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.github.com/graphql");
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             request.Headers.UserAgent.ParseAdd("GuiaDaTi/1.0");
@@ -88,9 +109,11 @@ public sealed class DiscussionsClient(IHttpClientFactory clients, IConfiguration
             // Never publish private content, even if the configured token can read it.
             if (data.ValueKind == JsonValueKind.Null || data.GetProperty("isPrivate").GetBoolean()
                 || !data.GetProperty("hasDiscussionsEnabled").GetBoolean()) throw new DiscussionsUnavailableException();
-            cached = root.GetProperty("data").Clone();
-            cache.Set(key, cached, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(1) });
-            return cached;
+            var fetched = root.GetProperty("data").Clone();
+            lock (cache)
+                if (version == generation)
+                    cache.Set(key, fetched, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(1) });
+            return fetched;
         }
         finally { gate.Release(); }
     }
