@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -8,7 +7,7 @@ using Microsoft.Extensions.Caching.Memory;
 public sealed class DiscussionsClient(IHttpClientFactory clients, IConfiguration configuration) : IDisposable
 {
     private readonly MemoryCache cache = new(new MemoryCacheOptions { SizeLimit = 128 });
-    private readonly ConcurrentDictionary<string, Task<JsonElement>> pending = new();
+    private readonly Dictionary<string, Task<JsonElement>> pending = new();
     private readonly SemaphoreSlim gate = new(6);
     private int generation;
     private readonly string repository = configuration["DISCUSSIONS_REPOSITORY"] ?? "guia-da-ti/guia-da-ti-dados";
@@ -69,24 +68,52 @@ public sealed class DiscussionsClient(IHttpClientFactory clients, IConfiguration
         var key = query + JsonSerializer.Serialize(variables);
         if (cache.TryGetValue(key, out JsonElement cached)) return cached;
         // Callers of the same key share one GitHub call; different keys only share the concurrency limit.
-        var mine = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var shared = pending.GetOrAdd(key, mine.Task);
-        if (shared == mine.Task) _ = FillAsync(key, query, variables, mine);
+        // The cache check, the shared call registration and its completion run under one lock, the network call outside it.
+        Task<JsonElement> shared;
+        TaskCompletionSource<JsonElement>? mine = null;
+        int version;
+        lock (cache)
+        {
+            if (cache.TryGetValue(key, out cached)) return cached;
+            version = generation;
+            if (!pending.TryGetValue(key, out shared!))
+            {
+                mine = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                pending[key] = shared = mine.Task;
+            }
+        }
+        if (mine is not null) _ = FillAsync(key, query, variables, version, mine);
         return await shared.WaitAsync(cancellation);
     }
 
-    private async Task FillAsync(string key, string query, object variables, TaskCompletionSource<JsonElement> result)
+    private async Task FillAsync(string key, string query, object variables, int version, TaskCompletionSource<JsonElement> result)
     {
-        try { result.SetResult(await FetchAsync(key, query, variables)); }
-        catch (Exception error) { result.SetException(error); }
-        finally { pending.TryRemove(KeyValuePair.Create(key, result.Task)); }
+        JsonElement fetched;
+        try { fetched = await FetchAsync(query, variables); }
+        catch (Exception error)
+        {
+            lock (cache) Forget(key, result.Task);
+            result.SetException(error);
+            return;
+        }
+        lock (cache)
+        {
+            if (version == generation)
+                cache.Set(key, fetched, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(1) });
+            Forget(key, result.Task);
+        }
+        result.SetResult(fetched);
+    }
+
+    private void Forget(string key, Task<JsonElement> task)
+    {
+        if (pending.TryGetValue(key, out var current) && current == task) pending.Remove(key);
     }
 
     // Shared by several callers, so one caller giving up does not cancel the others; the client timeout bounds it.
-    private async Task<JsonElement> FetchAsync(string key, string query, object variables)
+    private async Task<JsonElement> FetchAsync(string query, object variables)
     {
         var cancellation = CancellationToken.None;
-        var version = Volatile.Read(ref generation);
         await gate.WaitAsync(cancellation);
         try
         {
@@ -109,11 +136,7 @@ public sealed class DiscussionsClient(IHttpClientFactory clients, IConfiguration
             // Never publish private content, even if the configured token can read it.
             if (data.ValueKind == JsonValueKind.Null || data.GetProperty("isPrivate").GetBoolean()
                 || !data.GetProperty("hasDiscussionsEnabled").GetBoolean()) throw new DiscussionsUnavailableException();
-            var fetched = root.GetProperty("data").Clone();
-            lock (cache)
-                if (version == generation)
-                    cache.Set(key, fetched, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(1) });
-            return fetched;
+            return root.GetProperty("data").Clone();
         }
         finally { gate.Release(); }
     }

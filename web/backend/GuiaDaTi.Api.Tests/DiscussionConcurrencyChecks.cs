@@ -38,6 +38,22 @@ static class DiscussionConcurrencyChecks
         foreach (var number in Enumerable.Range(100, 20)) github.Release(number);
         await Within(Task.WhenAll(burst), "Burst completes after release");
         Check(github.MaxInFlight <= 6, "Concurrency stays limited");
+
+        // Callers that saw an empty cache must not start a new call after another caller completed and cached it.
+        var instant = new SlowGitHub();
+        using var racing = new DiscussionsClient(new FakeFactory(instant), settings);
+        const int rounds = 2000, callers = 32;
+        using var barrier = new Barrier(callers, _ => racing.InvalidateAsync(default).GetAwaiter().GetResult());
+        var threads = Enumerable.Range(0, callers).Select(_ => new Thread(() => {
+            for (var round = 0; round < rounds; round++)
+            {
+                barrier.SignalAndWait();
+                racing.ThreadAsync(2, null, default).GetAwaiter().GetResult();
+            }
+        })).ToArray();
+        foreach (var thread in threads) thread.Start();
+        foreach (var thread in threads) thread.Join();
+        Check(instant.CallsFor(2) == rounds, $"One GitHub call per round under contention ({instant.CallsFor(2)} calls in {rounds} rounds)");
     }
 
     static async Task Within(Task task, string name)
